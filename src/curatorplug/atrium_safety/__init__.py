@@ -25,7 +25,7 @@ from __future__ import annotations
 from curatorplug.atrium_safety.exceptions import ComplianceError
 from curatorplug.atrium_safety.plugin import AtriumSafetyPlugin
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",

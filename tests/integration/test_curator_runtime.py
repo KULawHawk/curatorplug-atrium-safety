@@ -358,3 +358,189 @@ class TestCoexistenceWithOtherHookimpls:
         # Recorder saw the event (so did atrium_safety, but its hookimpl
         # is silent in lax mode -- it doesn't show up in ``calls``).
         assert len(calls) == 1
+
+
+# ===========================================================================
+# v0.2.0: independent re-read verification (PLUGIN_INIT P2)
+# ===========================================================================
+
+
+class TestReReadVerificationAutoDiscovered:
+    """v0.2.0 added independent re-read verification: when Curator
+    >= 1.1.2 fires curator_plugin_init, the plugin saves the pm
+    reference and uses it to re-read dst bytes via
+    curator_source_read_bytes after each successful write, comparing
+    against src_xxhash.
+
+    These tests verify the auto-discovered plugin instance has its pm
+    populated by curator_plugin_init AND the re-read actually happens
+    on cross-source migrations.
+    """
+
+    def test_plugin_pm_is_populated_after_build_runtime(
+        self, runtime_with_plugin,
+    ):
+        """After build_runtime returns, the auto-discovered plugin
+        should have its pm reference populated by curator_plugin_init.
+        This is the prerequisite for the re-read verification to work
+        at all."""
+        plugin = _get_atrium_safety_plugin(runtime_with_plugin)
+        assert plugin.pm is not None, (
+            "plugin.pm is None -- curator_plugin_init didn't fire OR "
+            "didn't save the pm. Check Curator >= 1.1.2 is installed."
+        )
+        # Sanity: pm has the expected hooks
+        assert hasattr(plugin.pm, "hook")
+        assert hasattr(plugin.pm.hook, "curator_source_read_bytes")
+
+    def test_compliant_migration_passes_re_read_in_strict(
+        self, runtime_with_plugin, tmp_path,
+    ):
+        """A normal compliant migration in strict mode should pass
+        re-read verification (dst bytes match src hash) and produce a
+        successful MOVED outcome."""
+        rt = runtime_with_plugin
+        plugin = _get_atrium_safety_plugin(rt)
+        plugin.strict_mode = True
+        # Confirm pm is set (precondition for this test)
+        assert plugin.pm is not None
+
+        src_root = tmp_path / "src_re_read_strict_ok"
+        dst_root = tmp_path / "dst_re_read_strict_ok"
+        _seed_real_file(
+            rt, "local", src_root / "good.txt",
+            content=b"compliant content\n" * 50,
+        )
+
+        plan = rt.migration.plan(
+            src_source_id="local", src_root=str(src_root),
+            dst_source_id="local:vault", dst_root=str(dst_root),
+        )
+        report = rt.migration.apply(plan)
+
+        assert report.moved_count == 1
+        assert report.moves[0].outcome == MigrationOutcome.MOVED
+        assert report.moves[0].error is None
+
+    def test_re_read_catches_post_write_corruption_in_strict(
+        self, runtime_with_plugin, tmp_path,
+    ):
+        """Simulate a non-deterministic source plugin: the dst bytes
+        on disk get changed AFTER MigrationService's own verify
+        succeeds but BEFORE the safety plugin's re-read fires. The
+        safety plugin catches the inconsistency and refuses.
+
+        This is the headline value of the re-read feature: catching
+        cases that Curator's single-shot verify can't see (e.g., a
+        misbehaving plugin that returns different bytes on each
+        read, or a transient I/O issue between verify and re-read).
+
+        We simulate this by registering a high-priority
+        ``curator_source_write_post`` hookimpl that runs BEFORE the
+        safety plugin's hookimpl (via ``hookimpl(tryfirst=True)``) and
+        overwrites the dst file with corrupt bytes. The safety plugin
+        then reads via the LocalPlugin and sees the corruption.
+        """
+        rt = runtime_with_plugin
+        plugin = _get_atrium_safety_plugin(rt)
+        plugin.strict_mode = True
+        assert plugin.pm is not None
+
+        src_root = tmp_path / "src_re_read_catches"
+        dst_root = tmp_path / "dst_re_read_catches"
+        original_content = b"original honest content\n" * 5
+        _seed_real_file(
+            rt, "local", src_root / "sneaky.txt", content=original_content,
+        )
+
+        # Register a high-priority hookimpl that corrupts the dst file
+        # BEFORE the safety plugin's hookimpl fires. Pluggy invokes
+        # tryfirst=True hookimpls before others; among non-tryfirst
+        # hookimpls (like the safety plugin's), default registration
+        # order is used.
+        from curator.plugins import hookimpl as _hookimpl
+
+        class _Corrupter:
+            @_hookimpl(tryfirst=True)
+            def curator_source_write_post(
+                self, source_id, file_id, src_xxhash, written_bytes_len,
+            ):
+                # Overwrite the dst file with garbage. The safety
+                # plugin's re-read (firing AFTER us due to tryfirst)
+                # will read the corrupt file via LocalPlugin and see
+                # the mismatch.
+                if file_id and Path(file_id).exists():
+                    Path(file_id).write_bytes(
+                        b"CORRUPT-BYTES-FROM-ANOTHER-PLUGIN" * 4
+                    )
+
+        corrupter = _Corrupter()
+        rt.pm.register(corrupter, name="corrupter")
+        try:
+            plan = rt.migration.plan(
+                src_source_id="local", src_root=str(src_root),
+                dst_source_id="local:vault", dst_root=str(dst_root),
+            )
+            report = rt.migration.apply(plan)
+        finally:
+            rt.pm.unregister(corrupter)
+
+        # The safety plugin's re-read should have caught the corruption
+        # and refused via ComplianceError -> MigrationOutcome.FAILED.
+        assert report.moved_count == 0, (
+            f"expected refusal but got MOVED. moves[0]: {report.moves[0]}"
+        )
+        assert report.failed_count == 1
+        move = report.moves[0]
+        assert move.outcome == MigrationOutcome.FAILED
+        assert "independent re-read verification FAILED" in (move.error or "")
+        # Hashes should be in the error message (helpful for debugging)
+        assert "expected xxh3=" in (move.error or "")
+        assert "actual xxh3=" in (move.error or "")
+
+    def test_re_read_mismatch_does_not_refuse_in_lax(
+        self, runtime_with_plugin, tmp_path,
+    ):
+        """In lax mode, a re-read mismatch is logged but does NOT
+        refuse the migration. The migration still succeeds (MOVED).
+        This is the advisory mode behavior."""
+        rt = runtime_with_plugin
+        plugin = _get_atrium_safety_plugin(rt)
+        plugin.strict_mode = False  # LAX
+        assert plugin.pm is not None
+
+        src_root = tmp_path / "src_re_read_lax"
+        dst_root = tmp_path / "dst_re_read_lax"
+        _seed_real_file(
+            rt, "local", src_root / "x.txt", content=b"compliant\n" * 10,
+        )
+
+        # Same corrupter pattern
+        from curator.plugins import hookimpl as _hookimpl
+
+        class _Corrupter:
+            @_hookimpl(tryfirst=True)
+            def curator_source_write_post(
+                self, source_id, file_id, src_xxhash, written_bytes_len,
+            ):
+                if file_id and Path(file_id).exists():
+                    Path(file_id).write_bytes(b"LAX-CORRUPTION" * 4)
+
+        corrupter = _Corrupter()
+        rt.pm.register(corrupter, name="lax_corrupter")
+        try:
+            plan = rt.migration.plan(
+                src_source_id="local", src_root=str(src_root),
+                dst_source_id="local:vault", dst_root=str(dst_root),
+            )
+            report = rt.migration.apply(plan)
+        finally:
+            rt.pm.unregister(corrupter)
+
+        # Lax mode: migration MOVED despite re-read mismatch.
+        # The mismatch is logged at WARN level by the plugin (loguru
+        # filtering aside) but does not cause refusal.
+        assert report.moved_count == 1, (
+            f"expected MOVED but got refusal. moves[0]: {report.moves[0]}"
+        )
+        assert report.moves[0].outcome == MigrationOutcome.MOVED
