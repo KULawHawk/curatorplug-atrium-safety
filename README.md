@@ -87,6 +87,35 @@ $env:CURATORPLUG_ATRIUM_SAFETY_STRICT = "1"
 curator migrate --src-source-id local --src-root C:\Music --dst-source-id gdrive --dst-root MyFolder
 ```
 
+### What strict mode looks like when it refuses a write
+
+In strict mode, the plugin can refuse a migration in two distinct ways. Each is logged with a clear message that explains exactly which compliance condition tripped:
+
+**Refusal 1: source-side verification was skipped.** Triggered when the migration is run with `verify_hash=False` (e.g., a future `--no-verify-hash` CLI flag). The post-write hook receives `src_xxhash=None`; in strict mode this is a constitutional violation:
+
+```
+MigrationOutcome.FAILED
+error: ComplianceError: compliance: write proceeded without source-side
+hash verification (src_xxhash is None) while strict_mode=True. Atrium
+Constitution Principle 2 (Hash-Verify-Before-Move) requires verification;
+refusing the write.
+```
+
+**Refusal 2: independent re-read mismatch (v0.2.0+, requires Curator >= 1.1.2).** The plugin re-reads the destination via `curator_source_read_bytes` after the migration's own verify succeeds and recomputes the hash. If the recomputed hash differs from `src_xxhash`, that's evidence the source plugin returned different bytes on different reads (non-deterministic plugin bug, transient I/O issue, or misbehaving plugin):
+
+```
+MigrationOutcome.FAILED
+error: ComplianceError: compliance: independent re-read verification
+FAILED. expected xxh3=a1b2c3d4..., actual xxh3=ff00ff00.... This
+indicates the source plugin returned different bytes on a subsequent
+read than it did on the migration's verify read -- likely a
+non-deterministic plugin bug, transient I/O issue, or (worst case) a
+misbehaving plugin. Atrium Constitution Principle 2 (Hash-Verify-
+Before-Move) requires consistent verification. Refusing the write.
+```
+
+In both cases the source bytes are untouched, the FileEntity index continues pointing at the source, and the migration as a whole continues processing other files. The user can re-run with strict mode disabled if they trust the source, or fix the underlying source-plugin issue and retry.
+
 ## Module structure
 
 - `curatorplug.atrium_safety.exceptions` — `ComplianceError`
