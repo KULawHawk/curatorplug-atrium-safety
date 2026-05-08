@@ -12,7 +12,7 @@ Curator v1.1.3's new `curator_audit_event` hookspec. The audit log
 gains three new actions — `compliance.approved`, `compliance.refused`,
 `compliance.warned` — all under `actor='curatorplug.atrium_safety'`.
 Makes the plugin's decisions queryable via
-`curator audit-log query --actor curatorplug.atrium_safety`. Requires
+`curator audit --actor curatorplug.atrium_safety`. Requires
 Curator >= 1.1.3 for emission; gracefully no-ops on older Curator.
 
 ### Added
@@ -96,7 +96,7 @@ Curator >= 1.1.3 for emission; gracefully no-ops on older Curator.
 
 User-visible behavior CHANGES: the audit log gains new actions
 (`compliance.*`) that didn't exist before. Users running
-`curator audit-log query` will see new rows; users grepping audit
+`curator audit` will see new rows; users grepping audit
 log by `actor='curatorplug.atrium_safety'` will find data where
 there was none. That's intentional headline value; minor bump is
 honest.
