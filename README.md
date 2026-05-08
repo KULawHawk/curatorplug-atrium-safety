@@ -4,7 +4,7 @@
 Enforces Atrium Constitution **Principle 2 (Hash-Verify-Before-Move)** as a
 *cross-cutting layer* over Curator's plugin ecosystem.
 
-> Status: v0.1.0a1 — alpha. Auto-discovered via setuptools entry point.
+> Status: v0.1.0 — first stable release. Auto-discovered via setuptools entry point.
 > Default mode is lax (refuses nothing); strict mode is opt-in via env var.
 
 ## What this plugin does

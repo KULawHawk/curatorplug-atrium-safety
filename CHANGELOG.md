@@ -4,6 +4,88 @@ All notable changes documented here. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with semver
 versioning where reasonable.
 
+## [0.1.0] — 2026-05-08 — First stable release (Session P3)
+
+**Headline:** v0.1.0a1 → v0.1.0 (drop alpha suffix). All 53 tests
+passing (45 unit + 8 integration). Curator-runtime integration tests
+added; refusal-on-non-compliance proven end-to-end through a real
+``build_runtime`` invocation.
+
+### Added
+
+- **`tests/integration/test_curator_runtime.py`** — 8 integration tests
+  exercising the full end-to-end flow (real `CuratorRuntime`, real
+  pluggy plugin manager, real cross-source migration). Coverage:
+  - **`TestPluginAutoDiscovery`** (2 tests): plugin auto-registers via
+    setuptools entry point during ``build_runtime``; the registered
+    plugin is an instance, not the class (regression-guards the P2
+    entry-point fix).
+  - **`TestLaxModeDoesNotInterfere`** (2 tests): default lax mode
+    doesn't refuse legitimate migrations; even ``verify_hash=False``
+    migrations succeed in lax mode.
+  - **`TestStrictModeAllowsCompliantWrites`** (1 test): strict mode
+    allows migrations where source-side verify happened normally
+    (`verify_hash=True`, the default).
+  - **`TestStrictModeRefusesNonCompliantWrites`** (2 tests): the
+    headline tests — strict mode + `verify_hash=False` triggers
+    `ComplianceError`, propagates to `MigrationOutcome.FAILED`, and
+    leaves the index + source bytes intact (no corruption under
+    refusal).
+  - **`TestCoexistenceWithOtherHookimpls`** (1 test): the plugin
+    coexists with other registered hookimpls; all fire on each
+    `curator_source_write_post` event.
+
+### Changed
+
+- Version `0.1.0a1` → `0.1.0` in `pyproject.toml` and
+  `src/curatorplug/atrium_safety/__init__.py`.
+- Development status classifier `3 - Alpha` → `4 - Beta` (the plugin
+  has Curator-runtime integration coverage now; pre-1.0 because the
+  plumbing for independent re-read verification is still pending a
+  Curator-side hookspec amendment).
+- README status line updated to v0.1.0.
+
+### Verified at release
+
+- Plugin's full test suite: 53/53 pass (~3s wall-clock).
+- Curator regression with this plugin auto-discovered:
+  `tests/unit/test_migration_cross_source.py` 22/22 pass; full
+  migration + GUI slice 342/342 pass (verified earlier in P2).
+- Entry-point auto-discovery: confirmed `ep.load()` returns an
+  `AtriumSafetyPlugin` instance (the v0.1.0 release commit guards the
+  P2 entry-point fix via `TestPluginAutoDiscovery`).
+- Strict-mode refusal: confirmed end-to-end. The exact path:
+  1. User passes `verify_hash=False` to `MigrationService.apply()`
+     (or sets `verify_hash` to False via the CLI's `--no-verify-hash`
+     flag in a future release that exposes this).
+  2. `_cross_source_transfer` writes the bytes successfully but
+     skips its own verify; passes `src_xxhash=None` to the post-write
+     hook.
+  3. The plugin's `decide()` sees `src_xxhash is None` AND
+     `strict_mode=True`, returns `EnforcementVerdict.REFUSE` with a
+     message naming Atrium Constitution Principle 2.
+  4. `enforce()` raises `ComplianceError`.
+  5. `MigrationService`'s outer exception-boundary catches and turns
+     the move into `MigrationOutcome.FAILED` with the
+     `ComplianceError` message (including "Constitution Principle 2"
+     and "Hash-Verify-Before-Move") in `MigrationMove.error`.
+  6. The index is NOT updated; the source file is NOT trashed; the
+     dst file (already written) is leaked but harmless (next scan
+     picks it up as a duplicate).
+
+### Test pollution bug found and fixed during P3
+
+The initial integration tests used `Path(rt.config.db_path).parent /
+"src_X"` to construct paths, which on first inspection looks safe but
+actually resolves to the **production Curator data directory**
+(`%LOCALAPPDATA%\\curator\\` on Windows) — NOT the per-test `tmp_path`.
+First test run worked (fresh prod dir); subsequent runs failed because
+leftover dirs caused `MigrationOutcome.SKIPPED_COLLISION` instead of
+the expected MOVED/FAILED outcomes. Fixed by accepting `tmp_path` as a
+fixture parameter on each test method and using it directly. Pytest
+automatically gives fixture and test the same `tmp_path` instance per
+test function.
+
 ## [0.1.0a1] — 2026-05-08 — Initial scaffolding (Session P2)
 
 **Headline:** First package release. Strict-mode refusal + lax-mode
