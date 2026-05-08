@@ -544,3 +544,210 @@ class TestReReadVerificationAutoDiscovered:
             f"expected MOVED but got refusal. moves[0]: {report.moves[0]}"
         )
         assert report.moves[0].outcome == MigrationOutcome.MOVED
+
+
+# ===========================================================================
+# v0.3.0: structured audit events (CURATOR_AUDIT_EVENT P2)
+# ===========================================================================
+
+
+class TestComplianceAuditEvents:
+    """v0.3.0 added structured audit emission via the
+    ``curator_audit_event`` hookspec (Curator v1.1.3+). For every
+    enforcement decision, the plugin emits an audit log entry with
+    actor='curatorplug.atrium_safety' and action one of:
+      - compliance.approved
+      - compliance.refused
+      - compliance.warned
+
+    These tests verify the entries actually persist to the runtime's
+    audit_repo by querying after each migration.
+    """
+
+    def _query_safety_audits(self, rt):
+        """Helper: fetch all audit entries emitted by the safety plugin."""
+        return rt.audit_repo.query(actor="curatorplug.atrium_safety")
+
+    def test_compliance_approved_audit_in_strict_compliant_migration(
+        self, runtime_with_plugin, tmp_path,
+    ):
+        """A compliant strict-mode migration emits exactly one
+        compliance.approved audit entry per file."""
+        rt = runtime_with_plugin
+        plugin = _get_atrium_safety_plugin(rt)
+        plugin.strict_mode = True
+        assert plugin.pm is not None
+
+        src_root = tmp_path / "src_audit_approved_strict"
+        dst_root = tmp_path / "dst_audit_approved_strict"
+        _seed_real_file(
+            rt, "local", src_root / "good.txt", content=b"compliant\n" * 5,
+        )
+
+        # Sanity: no safety audits before migration
+        assert len(self._query_safety_audits(rt)) == 0
+
+        plan = rt.migration.plan(
+            src_source_id="local", src_root=str(src_root),
+            dst_source_id="local:vault", dst_root=str(dst_root),
+        )
+        report = rt.migration.apply(plan)
+        assert report.moved_count == 1
+
+        # Exactly one compliance.approved entry should have landed
+        audits = self._query_safety_audits(rt)
+        assert len(audits) == 1
+        entry = audits[0]
+        assert entry.actor == "curatorplug.atrium_safety"
+        assert entry.action == "compliance.approved"
+        assert entry.entity_type == "file"
+        assert entry.entity_id is not None  # the dst path
+        # Details should describe the decision
+        assert entry.details["phase"] == "re-read"  # Both phases passed
+        assert entry.details["mode"] == "strict"
+        assert entry.details["written_bytes_len"] > 0
+        assert "src_xxhash_prefix" in entry.details
+
+    def test_compliance_refused_audit_in_strict_re_read_mismatch(
+        self, runtime_with_plugin, tmp_path,
+    ):
+        """When strict-mode re-read catches corruption, a
+        compliance.refused audit entry is emitted with phase='re-read'
+        and the reason naming both expected and actual hashes."""
+        rt = runtime_with_plugin
+        plugin = _get_atrium_safety_plugin(rt)
+        plugin.strict_mode = True
+        assert plugin.pm is not None
+
+        src_root = tmp_path / "src_audit_refused"
+        dst_root = tmp_path / "dst_audit_refused"
+        _seed_real_file(
+            rt, "local", src_root / "sneaky.txt",
+            content=b"original honest content\n" * 5,
+        )
+
+        # Same tryfirst=True corrupter pattern as the v0.2.0 tests
+        from curator.plugins import hookimpl as _hookimpl
+
+        class _Corrupter:
+            @_hookimpl(tryfirst=True)
+            def curator_source_write_post(
+                self, source_id, file_id, src_xxhash, written_bytes_len,
+            ):
+                if file_id and Path(file_id).exists():
+                    Path(file_id).write_bytes(b"CORRUPT" * 8)
+
+        corrupter = _Corrupter()
+        rt.pm.register(corrupter, name="audit_test_corrupter")
+        try:
+            plan = rt.migration.plan(
+                src_source_id="local", src_root=str(src_root),
+                dst_source_id="local:vault", dst_root=str(dst_root),
+            )
+            report = rt.migration.apply(plan)
+        finally:
+            rt.pm.unregister(corrupter)
+
+        assert report.failed_count == 1
+
+        audits = self._query_safety_audits(rt)
+        # Exactly one compliance.refused entry
+        refused = [a for a in audits if a.action == "compliance.refused"]
+        assert len(refused) == 1
+        entry = refused[0]
+        assert entry.entity_type == "file"
+        assert entry.details["phase"] == "re-read"
+        assert entry.details["mode"] == "strict"
+        # Reason should contain the diagnostic info
+        assert "reason" in entry.details
+        assert "independent re-read verification FAILED" in entry.details["reason"]
+        assert "expected xxh3=" in entry.details["reason"]
+        assert "actual xxh3=" in entry.details["reason"]
+
+    def test_compliance_warned_audit_in_lax_re_read_mismatch(
+        self, runtime_with_plugin, tmp_path,
+    ):
+        """When lax-mode re-read catches corruption, a
+        compliance.warned audit entry is emitted (advisory; the
+        migration still succeeds)."""
+        rt = runtime_with_plugin
+        plugin = _get_atrium_safety_plugin(rt)
+        plugin.strict_mode = False  # LAX
+        assert plugin.pm is not None
+
+        src_root = tmp_path / "src_audit_warned"
+        dst_root = tmp_path / "dst_audit_warned"
+        _seed_real_file(
+            rt, "local", src_root / "x.txt", content=b"original\n" * 8,
+        )
+
+        from curator.plugins import hookimpl as _hookimpl
+
+        class _Corrupter:
+            @_hookimpl(tryfirst=True)
+            def curator_source_write_post(
+                self, source_id, file_id, src_xxhash, written_bytes_len,
+            ):
+                if file_id and Path(file_id).exists():
+                    Path(file_id).write_bytes(b"WARN-CORRUPT" * 4)
+
+        corrupter = _Corrupter()
+        rt.pm.register(corrupter, name="audit_test_warn_corrupter")
+        try:
+            plan = rt.migration.plan(
+                src_source_id="local", src_root=str(src_root),
+                dst_source_id="local:vault", dst_root=str(dst_root),
+            )
+            report = rt.migration.apply(plan)
+        finally:
+            rt.pm.unregister(corrupter)
+
+        # Lax mode -> migration MOVED despite the mismatch
+        assert report.moved_count == 1
+
+        audits = self._query_safety_audits(rt)
+        warned = [a for a in audits if a.action == "compliance.warned"]
+        assert len(warned) == 1
+        entry = warned[0]
+        assert entry.details["phase"] == "re-read"
+        assert entry.details["mode"] == "lax"
+        assert "reason" in entry.details
+        assert "independent re-read verification FAILED" in entry.details["reason"]
+        assert "lax mode" in entry.details["reason"]
+
+    def test_audit_events_queryable_by_actor(
+        self, runtime_with_plugin, tmp_path,
+    ):
+        """After multiple migrations, all safety audits are queryable
+        by actor='curatorplug.atrium_safety'. This is the headline
+        capability that v0.3.0 unlocks: 'curator audit-log query
+        --actor curatorplug.atrium_safety' returns real data."""
+        rt = runtime_with_plugin
+        plugin = _get_atrium_safety_plugin(rt)
+        plugin.strict_mode = True
+        assert plugin.pm is not None
+
+        # Run two compliant migrations -> two approved audits
+        for i in range(2):
+            src_root = tmp_path / f"src_query_{i}"
+            dst_root = tmp_path / f"dst_query_{i}"
+            _seed_real_file(
+                rt, "local", src_root / f"file_{i}.txt",
+                content=f"content {i}\n".encode() * 5,
+            )
+            plan = rt.migration.plan(
+                src_source_id="local", src_root=str(src_root),
+                dst_source_id="local:vault", dst_root=str(dst_root),
+            )
+            report = rt.migration.apply(plan)
+            assert report.moved_count == 1
+
+        audits = self._query_safety_audits(rt)
+        # Two approved audits, plus zero of any other action
+        assert len(audits) == 2
+        actions = [a.action for a in audits]
+        assert all(a == "compliance.approved" for a in actions)
+        # Each audit should have a unique entity_id (different dst path
+        # per migration)
+        entity_ids = [a.entity_id for a in audits]
+        assert len(set(entity_ids)) == 2

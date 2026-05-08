@@ -30,13 +30,23 @@ access (older Curator, or pm not provided), the plugin gracefully
 degrades to v0.1.0 behavior (strict-mode-refusal-only on skipped
 verify).
 
-Future: a proper config integration (read from ``curator.toml``
-``[plugins.atrium_safety]`` section) is a v0.3.0+ candidate.
+Structured audit events (v0.3.0+): when Curator >= 1.1.3 is installed,
+the plugin uses the ``curator_audit_event`` hookspec to write
+structured audit log entries for every enforcement decision. Three
+actions are emitted: ``compliance.approved`` (every successful
+decision), ``compliance.refused`` (every refusal), and
+``compliance.warned`` (lax-mode re-read mismatches). The audit log
+becomes the queryable record of what the plugin did and why.
+``actor='curatorplug.atrium_safety'``; ``entity_type='file'``;
+``entity_id=file_id`` (the dst path). When running against Curator
+1.1.2 (which has ``curator_plugin_init`` but not
+``curator_audit_event``), audit emission silently no-ops.
 """
 
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from loguru import logger
 
@@ -59,6 +69,12 @@ from curatorplug.atrium_safety.verifier import compute_xxh3
 # Chunk size for re-reading dst bytes via curator_source_read_bytes.
 # Matches Curator's hash_pipeline default (64KB).
 _RE_READ_CHUNK_SIZE = 64 * 1024
+
+# Audit-event constants (v0.3.0+)
+_ACTOR = "curatorplug.atrium_safety"
+_ACTION_APPROVED = "compliance.approved"
+_ACTION_REFUSED = "compliance.refused"
+_ACTION_WARNED = "compliance.warned"
 
 
 def _read_strict_mode_env() -> bool:
@@ -98,7 +114,8 @@ class AtriumSafetyPlugin:
         # pm reference, populated by curator_plugin_init hookimpl when
         # Curator >= 1.1.2 is installed. None when running against
         # older Curator -- the plugin gracefully degrades to v0.1.0
-        # behavior (refusal-only on skipped verify, no re-read).
+        # behavior (refusal-only on skipped verify, no re-read, no
+        # audit emission).
         self.pm = None
         logger.debug(
             "AtriumSafetyPlugin: initialized with strict_mode={s}",
@@ -113,11 +130,8 @@ class AtriumSafetyPlugin:
         after all plugins are registered. The pm is needed in
         :meth:`curator_source_write_post` to call
         ``curator_source_read_bytes`` for independent re-read
-        verification.
-
-        See ``Curator/docs/PLUGIN_INIT_HOOKSPEC_DESIGN.md`` v0.2 for
-        the design that motivated this hook, and ``self._verify_via_re_read``
-        below for how the saved pm is used.
+        verification (v0.2.0+) and ``curator_audit_event`` for
+        structured audit log emission (v0.3.0+).
 
         Note: this hookimpl is silently ignored when running against
         Curator < 1.1.2 (which doesn't fire this hook); ``self.pm``
@@ -139,26 +153,30 @@ class AtriumSafetyPlugin:
     ) -> None:
         """Hookimpl for Curator's ``curator_source_write_post`` (v1.1.1+).
 
-        Two-phase enforcement:
+        Two-phase enforcement with structured audit emission:
 
         1. **Decide-phase:** call :func:`decide` to evaluate the basic
            compliance rules (negative bytes_len, strict + no
-           src_xxhash). Raise ``ComplianceError`` via :func:`enforce`
-           if the verdict is REFUSE.
+           src_xxhash). Emit ``compliance.refused`` audit + raise
+           ``ComplianceError`` if the verdict is REFUSE.
 
         2. **Re-read-phase (v0.2.0+):** if ``self.pm is not None`` AND
            ``src_xxhash is not None``, perform an INDEPENDENT verify by
            re-reading the dst bytes via ``curator_source_read_bytes``
-           and recomputing the hash. Raise ``ComplianceError`` if the
-           re-read hash differs from ``src_xxhash`` (in strict mode);
-           log at WARN level and allow the migration to proceed in
-           lax mode.
+           and recomputing the hash. Emit ``compliance.refused`` +
+           raise on strict-mode mismatch; emit ``compliance.warned``
+           and continue on lax-mode mismatch.
 
-        See ``enforcer.py`` for the decide-phase policy, and
-        ``self._verify_via_re_read`` for the re-read-phase mechanics.
+        On successful enforcement (no refusal), emit
+        ``compliance.approved`` (v0.3.0+) so the audit log captures
+        every decision the plugin makes.
+
+        See ``enforcer.py`` for the decide-phase policy,
+        ``self._verify_via_re_read`` for the re-read mechanics, and
+        ``self._fire_audit_event`` for the audit emission.
         """
-        # Phase 1: existing decide() logic
-        decision = decide(
+        # Phase 1: decide() ---------------------------------------------
+        decide_decision = decide(
             source_id=source_id,
             file_id=file_id,
             src_xxhash=src_xxhash,
@@ -167,26 +185,142 @@ class AtriumSafetyPlugin:
         )
         logger.debug(
             "AtriumSafetyPlugin: decide-phase verdict={v}, msg={m}",
-            v=decision.verdict.value, m=decision.message,
+            v=decide_decision.verdict.value, m=decide_decision.message,
         )
-        # Enforce raises on REFUSE; no-op otherwise.
-        enforce(decision)
 
-        # Phase 2: re-read verification (v0.2.0+).
-        # Only attempt if we have pm access (Curator >= 1.1.2 fired
-        # curator_plugin_init for us) AND we have an expected hash to
-        # compare against (caller didn't skip verify).
-        if self.pm is not None and src_xxhash is not None:
-            re_read_decision = self._verify_via_re_read(
-                source_id=source_id,
+        if decide_decision.verdict == EnforcementVerdict.REFUSE:
+            # Refusal in decide-phase: emit audit BEFORE raising so the
+            # event lands in the log even though MigrationService will
+            # convert this to MigrationOutcome.FAILED.
+            self._fire_audit_event(
+                action=_ACTION_REFUSED,
                 file_id=file_id,
-                expected_xxhash=src_xxhash,
+                phase="decide",
+                src_xxhash=src_xxhash,
+                written_bytes_len=written_bytes_len,
+                reason=decide_decision.message,
             )
-            logger.debug(
-                "AtriumSafetyPlugin: re-read-phase verdict={v}, msg={m}",
-                v=re_read_decision.verdict.value, m=re_read_decision.message,
+            enforce(decide_decision)  # raises ComplianceError
+            return  # unreachable; defensive
+
+        # Decide verdict is OK; determine whether Phase 2 will run.
+        will_re_read = (self.pm is not None and src_xxhash is not None)
+
+        if not will_re_read:
+            # Decide approved, no re-read possible (older Curator OR
+            # no expected hash to compare against): emit approved audit
+            # for the decide-phase-only path.
+            self._fire_audit_event(
+                action=_ACTION_APPROVED,
+                file_id=file_id,
+                phase="decide",
+                src_xxhash=src_xxhash,
+                written_bytes_len=written_bytes_len,
+            )
+            return
+
+        # Phase 2: re-read verification ---------------------------------
+        re_read_decision = self._verify_via_re_read(
+            source_id=source_id,
+            file_id=file_id,
+            expected_xxhash=src_xxhash,
+        )
+        logger.debug(
+            "AtriumSafetyPlugin: re-read-phase verdict={v}, msg={m}",
+            v=re_read_decision.verdict.value, m=re_read_decision.message,
+        )
+
+        if re_read_decision.verdict == EnforcementVerdict.REFUSE:
+            # Refusal in re-read phase: emit audit, then raise.
+            self._fire_audit_event(
+                action=_ACTION_REFUSED,
+                file_id=file_id,
+                phase="re-read",
+                src_xxhash=src_xxhash,
+                written_bytes_len=written_bytes_len,
+                reason=re_read_decision.message,
             )
             enforce(re_read_decision)
+            return  # unreachable; defensive
+
+        if re_read_decision.verdict == EnforcementVerdict.WARN:
+            # Lax-mode re-read mismatch: emit warned audit (advisory
+            # only), DO NOT raise. Migration proceeds.
+            self._fire_audit_event(
+                action=_ACTION_WARNED,
+                file_id=file_id,
+                phase="re-read",
+                src_xxhash=src_xxhash,
+                written_bytes_len=written_bytes_len,
+                reason=re_read_decision.message,
+            )
+            return
+
+        # Both phases OK: emit approved audit. The 'phase' field reads
+        # 're-read' here because re-read was the LAST gate the write
+        # passed; queries by phase='re-read' will surface every fully-
+        # verified migration in strict mode (or lax with matching dst).
+        self._fire_audit_event(
+            action=_ACTION_APPROVED,
+            file_id=file_id,
+            phase="re-read",
+            src_xxhash=src_xxhash,
+            written_bytes_len=written_bytes_len,
+        )
+
+    def _fire_audit_event(
+        self,
+        *,
+        action: str,
+        file_id: str,
+        phase: str,
+        src_xxhash: str | None,
+        written_bytes_len: int,
+        reason: str | None = None,
+    ) -> None:
+        """Emit a structured audit event via ``curator_audit_event``.
+
+        Silently no-ops if ``self.pm is None`` (Curator < 1.1.2) or if
+        ``curator_audit_event`` isn't a registered hookspec on the pm
+        (Curator 1.1.2 has ``curator_plugin_init`` but not
+        ``curator_audit_event`` -- it shipped in 1.1.3).
+
+        Failures during emission are logged but never propagate, per
+        Curator's best-effort audit semantics (see Curator's
+        ``CURATOR_AUDIT_EVENT_HOOKSPEC_DESIGN.md`` v0.2 DM-4).
+        """
+        if self.pm is None:
+            return  # pre-1.1.2 Curator
+        if not hasattr(self.pm.hook, "curator_audit_event"):
+            return  # pre-1.1.3 Curator (1.1.2 has init but not audit_event)
+
+        details: dict[str, Any] = {
+            "phase": phase,
+            "mode": "strict" if self.strict_mode else "lax",
+            "written_bytes_len": written_bytes_len,
+        }
+        # Include src_xxhash (truncated for log readability) when
+        # available. The full hash is recoverable from the migration
+        # audit row's src_xxhash column anyway.
+        if src_xxhash is not None:
+            details["src_xxhash_prefix"] = src_xxhash[:12]
+        if reason is not None:
+            details["reason"] = reason
+
+        try:
+            self.pm.hook.curator_audit_event(
+                actor=_ACTOR,
+                action=action,
+                entity_type="file",
+                entity_id=file_id,
+                details=details,
+            )
+        except Exception as e:  # noqa: BLE001 -- best-effort emission
+            logger.warning(
+                "AtriumSafetyPlugin: failed to emit audit event "
+                "action={ac} entity_id={eid}: {err}",
+                ac=action, eid=file_id, err=e,
+            )
 
     def _verify_via_re_read(
         self,

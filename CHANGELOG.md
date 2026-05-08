@@ -4,6 +4,118 @@ All notable changes documented here. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with semver
 versioning where reasonable.
 
+## [0.3.0] — 2026-05-08 — Structured audit emission (CURATOR_AUDIT_EVENT P2)
+
+**Headline:** v0.2.0 → v0.3.0 (minor bump). The plugin now emits
+**structured audit log entries** for every enforcement decision via
+Curator v1.1.3's new `curator_audit_event` hookspec. The audit log
+gains three new actions — `compliance.approved`, `compliance.refused`,
+`compliance.warned` — all under `actor='curatorplug.atrium_safety'`.
+Makes the plugin's decisions queryable via
+`curator audit-log query --actor curatorplug.atrium_safety`. Requires
+Curator >= 1.1.3 for emission; gracefully no-ops on older Curator.
+
+### Added
+
+- **`AtriumSafetyPlugin._fire_audit_event`** — helper that emits a
+  structured event via `pm.hook.curator_audit_event(...)`. Silently
+  no-ops in three cases for graceful degradation:
+  - `self.pm is None` (Curator < 1.1.2)
+  - `pm.hook.curator_audit_event` doesn't exist (Curator 1.1.2 has
+    `curator_plugin_init` but not `curator_audit_event`)
+  - The hook call itself raises (logged at warn; never propagated)
+- **Audit emission in `curator_source_write_post`** at all 5
+  enforcement decision branches:
+  - Decide-phase REFUSE → `compliance.refused` with `phase='decide'`
+    BEFORE raising (so the event lands even though MigrationService
+    converts to FAILED)
+  - Decide approved + no re-read possible → `compliance.approved`
+    with `phase='decide'`
+  - Re-read REFUSE (strict mode mismatch) → `compliance.refused`
+    with `phase='re-read'` BEFORE raising
+  - Re-read WARN (lax mode mismatch) → `compliance.warned` with
+    `phase='re-read'` (advisory only; doesn't refuse)
+  - Both phases OK → `compliance.approved` with `phase='re-read'`
+- **Structured `details` field** on every audit entry includes:
+  `phase` (`'decide'` or `'re-read'`), `mode` (`'strict'` or `'lax'`),
+  `written_bytes_len`, `src_xxhash_prefix` (first 12 chars of the
+  source hash), and on refusals/warnings, `reason` (the human-readable
+  message naming the constitutional condition that tripped).
+
+### Tests (+4 new — 71 → 75 total)
+
+- **`tests/integration/test_curator_runtime.py::TestComplianceAuditEvents`**
+  (4 new integration tests):
+  - `test_compliance_approved_audit_in_strict_compliant_migration`:
+    a normal compliant migration in strict mode produces exactly one
+    `compliance.approved` audit entry with the expected schema
+    (phase, mode, written_bytes_len, src_xxhash_prefix).
+  - `test_compliance_refused_audit_in_strict_re_read_mismatch`: when
+    strict-mode re-read catches dst corruption, a
+    `compliance.refused` audit entry is emitted with phase='re-read',
+    mode='strict', and `reason` containing the diagnostic info
+    ("independent re-read verification FAILED", expected/actual
+    hashes). The audit lands BEFORE the migration is converted to
+    FAILED — so the event survives even though the move "failed".
+  - `test_compliance_warned_audit_in_lax_re_read_mismatch`: same
+    corruption scenario but in lax mode — `compliance.warned` audit
+    entry, mode='lax', and migration still MOVED.
+  - `test_audit_events_queryable_by_actor`: after multiple
+    migrations, all safety audits are queryable by
+    `actor='curatorplug.atrium_safety'`. Headline capability proof.
+
+### Changed
+
+- Version `0.2.0` → `0.3.0` (minor bump because audit log gains
+  observable new entries that didn't exist before).
+- `pyproject.toml` and `__init__.py` `__version__` reflect 0.3.0.
+- Module docstring on `plugin.py` updated with v0.3.0 audit emission
+  details.
+
+### Backward compatibility
+
+- **Strictly additive when running against Curator 1.1.3+.** All
+  v0.2.0 enforcement behavior preserved; audit emission is a NEW
+  parallel observability channel.
+- **Graceful degradation against Curator 1.1.2.** Without the
+  `curator_audit_event` hookspec, `_fire_audit_event` checks
+  `hasattr(pm.hook, 'curator_audit_event')` and silently returns. The
+  enforcement behavior (decide + re-read) is unchanged; only the
+  audit channel is unavailable.
+- **Graceful degradation against Curator < 1.1.2.** Without
+  `curator_plugin_init`, `self.pm` stays None, and both re-read AND
+  audit emission no-op. Plugin behaves exactly like v0.1.0.
+- **Lax-mode users see new audit entries** for every observation
+  (compliance.approved per migration plus compliance.warned for
+  re-read mismatches). This is the intended observable change.
+- **Strict-mode users see new audit entries** for every decision
+  (approved per migration; refused on enforcement failures). The
+  refusal behavior itself is unchanged from v0.2.0.
+
+### Why a minor (0.2.0 → 0.3.0) and not a patch
+
+User-visible behavior CHANGES: the audit log gains new actions
+(`compliance.*`) that didn't exist before. Users running
+`curator audit-log query` will see new rows; users grepping audit
+log by `actor='curatorplug.atrium_safety'` will find data where
+there was none. That's intentional headline value; minor bump is
+honest.
+
+### Cross-references
+
+- `Curator/docs/CURATOR_AUDIT_EVENT_HOOKSPEC_DESIGN.md` v0.2
+  (RATIFIED 2026-05-08) — the design that motivated this release;
+  this is P2 of its 3-session plan. P3 is regression sweep +
+  safety-plugin DESIGN.md v0.4 stamp.
+- `Curator/CHANGELOG.md` `[1.1.3]` — the host release that ships the
+  `curator_audit_event` hookspec this plugin consumes.
+- `curatorplug-atrium-safety/DESIGN.md` v0.3 §9 — the explicit
+  pointer naming this audit-emission capability as the natural
+  follow-on after PLUGIN_INIT closed. v0.4 will mark it IMPLEMENTED.
+- Atrium Constitution Principle 4 (No Silent Failures) — the
+  constitutional grounding now satisfied for enforcement decisions:
+  every decision the plugin makes is now queryable.
+
 ## [0.2.0] — 2026-05-08 — Independent re-read verification (PLUGIN_INIT P2)
 
 **Headline:** v0.1.0 → v0.2.0 (minor bump). The plugin now performs
