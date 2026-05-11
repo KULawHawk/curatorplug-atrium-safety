@@ -76,6 +76,10 @@ _ACTION_APPROVED = "compliance.approved"
 _ACTION_REFUSED = "compliance.refused"
 _ACTION_WARNED = "compliance.warned"
 
+# T-B02 (v0.4.0+) retention enforcement audit actions
+_ACTION_RETENTION_VETO = "compliance.retention_veto"
+_ACTION_RETENTION_ALLOW = "compliance.retention_allow"
+
 
 def _read_strict_mode_env() -> bool:
     """Parse the ``CURATORPLUG_ATRIUM_SAFETY_STRICT`` env var.
@@ -266,6 +270,118 @@ class AtriumSafetyPlugin:
             phase="re-read",
             src_xxhash=src_xxhash,
             written_bytes_len=written_bytes_len,
+        )
+
+    @hookimpl
+    def curator_pre_trash(self, file, reason: str):
+        """T-B02 retention enforcement (v0.4.0+).
+
+        Vetoes ``send_to_trash`` calls for files classified as
+        ``status='vital'``. A vital file is one the user has explicitly
+        marked as not-to-be-lost (forensic records, regulatory-retention
+        documents, foundational research data, etc.). The plugin
+        cooperates with Curator's :class:`TrashService` by returning
+        :class:`ConfirmationResult(allow=False, ...)`.
+
+        Retention horizon (``expires_at``): if a vital file also has an
+        ``expires_at`` timestamp set and that timestamp has passed,
+        the veto is LIFTED. This supports timed retention windows
+        (e.g. "keep this for 7 years, then it's OK to trash").
+
+        Override paths: the user can bypass this veto by either:
+
+          1. Re-classifying the file: ``curator status set <path> active``
+             (audit logged via cli.status; veto no longer applies)
+          2. Setting ``expires_at`` to a past date:
+             ``curator status set <path> vital --expires-in-days -1``
+          3. Hard delete bypassing TrashService (DO NOT DO THIS without
+             knowing exactly what you're doing; intentionally not
+             exposed via CLI).
+
+        Graceful degradation:
+
+          * Files without a ``status`` attribute (Curator < v1.7.3,
+            pre-migration-003): assumed ``active``; never veto.
+          * Plugin not yet ``curator_plugin_init``'d: vetoes still
+            fire because no pm access is needed for the check itself.
+            Audit emission is skipped (pm-dependent) but the veto
+            still works.
+
+        Returns:
+            ``ConfirmationResult(allow=False, ...)`` to veto; ``None``
+            to allow (default behavior unchanged).
+        """
+        # Defensive: handle pre-migration-003 FileEntity that lacks
+        # the .status attribute. Older Curator returns FileEntity
+        # without status; treat as 'active' and skip the veto.
+        status = getattr(file, "status", "active") or "active"
+
+        if status != "vital":
+            return None  # Allow trash to proceed
+
+        # Check retention horizon: if expires_at is set and in the
+        # past, the retention window has elapsed and the veto lifts.
+        expires_at = getattr(file, "expires_at", None)
+        if expires_at is not None:
+            from datetime import datetime as _dt
+            now = _dt.utcnow()
+            # Both naive UTC datetimes; direct comparison.
+            if expires_at <= now:
+                # Retention period has passed; allow but emit an audit
+                # event so the trail records the policy decision.
+                file_id_str = str(getattr(file, "curator_id", ""))
+                self._fire_audit_event(
+                    action=_ACTION_RETENTION_ALLOW,
+                    file_id=file_id_str,
+                    phase="pre_trash",
+                    src_xxhash=None,
+                    written_bytes_len=0,
+                    reason=(
+                        f"Vital file retention period elapsed "
+                        f"(expires_at={expires_at.isoformat()}); trash allowed."
+                    ),
+                )
+                return None
+
+        # Veto: vital file with no expires_at, or expires_at in future.
+        msg_parts = [
+            f"File classified as 'vital' "
+            f"(T-B02 retention enforcement; atrium-safety v0.4.0+).",
+        ]
+        if expires_at is not None:
+            msg_parts.append(
+                f"Retention horizon: {expires_at.isoformat()}."
+            )
+        msg_parts.append(
+            "Reclassify with 'curator status set <path> active' to allow trash."
+        )
+        veto_reason = " ".join(msg_parts)
+
+        # Emit audit event for the veto (best-effort; no-op if pm unset)
+        file_id_str = str(getattr(file, "curator_id", ""))
+        self._fire_audit_event(
+            action=_ACTION_RETENTION_VETO,
+            file_id=file_id_str,
+            phase="pre_trash",
+            src_xxhash=None,
+            written_bytes_len=0,
+            reason=veto_reason,
+        )
+        logger.info(
+            "AtriumSafetyPlugin: VETOED trash of vital file {p} (curator_id={cid})",
+            p=getattr(file, "source_path", "<unknown>"),
+            cid=file_id_str,
+        )
+
+        # Late-import to avoid a hard dependency at module load time on
+        # Curator's model layout. If ConfirmationResult moves, we'll fail
+        # at hookimpl-call time rather than at plugin-load time, which
+        # is the right tradeoff.
+        from curator.models.results import ConfirmationResult
+        return ConfirmationResult(
+            allow=False,
+            reason=veto_reason,
+            plugin=_ACTOR,
         )
 
     def _fire_audit_event(
